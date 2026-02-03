@@ -13,22 +13,25 @@ import logging
 import webbrowser
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from gpu_deploy_llm import __version__
 from gpu_deploy_llm.client import ShopperClient, SessionStatus
 from gpu_deploy_llm.models import calculate_requirements, Quantization, list_models
 from gpu_deploy_llm.models.requirements import select_best_offer
-from gpu_deploy_llm.ssh import SSHConnection
-from gpu_deploy_llm.deploy import VLLMDeployer, DeploymentConfig, HealthChecker
+from gpu_deploy_llm.ssh import SSHConnection, HostDiagnosticsCollector
+from gpu_deploy_llm.deploy import (
+    VLLMDeployer, DeploymentConfig, HealthChecker, Benchmarker,
+    BenchmarkStore, create_benchmark_record,
+)
 from gpu_deploy_llm.diagnostics import DiagnosticCollector, Checkpoint
 from gpu_deploy_llm.utils.errors import StaleInventoryError
 
@@ -39,6 +42,24 @@ _shopper_url: str = "http://localhost:8080"
 _debug: bool = False
 _active_connections: Set[WebSocket] = set()
 _current_test: Optional["TestRunner"] = None
+_current_task: Optional[asyncio.Task] = None
+_test_lock: Optional[asyncio.Lock] = None  # Initialized in lifespan
+_connections_lock: Optional[asyncio.Lock] = None  # Initialized in lifespan
+MAX_WEBSOCKET_CONNECTIONS = 100
+
+
+def _get_test_lock() -> asyncio.Lock:
+    """Get test lock, raising if not initialized."""
+    if _test_lock is None:
+        raise RuntimeError("Server not initialized - test_lock is None")
+    return _test_lock
+
+
+def _get_connections_lock() -> asyncio.Lock:
+    """Get connections lock, raising if not initialized."""
+    if _connections_lock is None:
+        raise RuntimeError("Server not initialized - connections_lock is None")
+    return _connections_lock
 
 
 class EventType(str, Enum):
@@ -58,7 +79,7 @@ class WebSocketEvent:
 
     type: EventType
     data: Dict[str, Any]
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
 
     def to_json(self) -> str:
         return json.dumps({"type": self.type.value, **self.data, "timestamp": self.timestamp})
@@ -75,6 +96,32 @@ class TestConfig(BaseModel):
     skip_verification: bool = False
     auto_cleanup: bool = True
 
+    @field_validator("max_price")
+    @classmethod
+    def validate_max_price(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("max_price must be positive")
+        if v > 100:
+            raise ValueError("max_price exceeds maximum ($100/hr)")
+        return v
+
+    @field_validator("reservation_hours")
+    @classmethod
+    def validate_reservation_hours(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("reservation_hours must be at least 1")
+        if v > 24:
+            raise ValueError("reservation_hours exceeds maximum (24)")
+        return v
+
+    @field_validator("quantization")
+    @classmethod
+    def validate_quantization(cls, v: str) -> str:
+        valid = {"none", "awq", "gptq", "squeezellm", "fp8"}
+        if v.lower() not in valid:
+            raise ValueError(f"quantization must be one of: {', '.join(valid)}")
+        return v.lower()
+
 
 class TestRunner:
     """Runs a deployment test and emits events."""
@@ -86,8 +133,10 @@ class TestRunner:
         "create_session",
         "wait_for_running",
         "connect_ssh",
+        "diagnose_host",
         "deploy_vllm",
         "verify_deployment",
+        "benchmark",
         "cleanup",
     ]
 
@@ -105,6 +154,10 @@ class TestRunner:
     async def run(self) -> None:
         """Run the test and emit events."""
         try:
+            if self._cancelled:
+                await self._log("info", "Test cancelled")
+                return
+
             await self._emit_status("calculate_requirements", "running")
             await self._log("info", f"Calculating requirements for {self.config.model_id}")
 
@@ -116,6 +169,10 @@ class TestRunner:
                 f"Requirements: {requirements.min_vram_gb}GB VRAM, {requirements.min_gpu_count} GPU(s)",
             )
             await self._emit_status("calculate_requirements", "complete")
+
+            if self._cancelled:
+                await self._log("info", "Test cancelled")
+                return
 
             async with ShopperClient(self.shopper_url, debug=self.debug) as client:
                 # Check shopper health
@@ -137,6 +194,10 @@ class TestRunner:
                 )
                 await self._log("info", f"Found {len(offers)} offers")
                 await self._emit_status("query_inventory", "complete")
+
+                if self._cancelled:
+                    await self._log("info", "Test cancelled")
+                    return
 
                 if not offers:
                     raise Exception("No suitable GPU offers found")
@@ -185,6 +246,10 @@ class TestRunner:
 
                 await self._emit_status("create_session", "complete")
 
+                if self._cancelled:
+                    await self._log("info", "Test cancelled")
+                    return
+
                 # Wait for running
                 await self._emit_status("wait_for_running", "running")
                 session = await client.wait_for_running(
@@ -195,6 +260,10 @@ class TestRunner:
                 await self._emit_session(session)
                 await self._emit_status("wait_for_running", "complete")
 
+                if self._cancelled:
+                    await self._log("info", "Test cancelled")
+                    return
+
                 # Connect SSH
                 await self._emit_status("connect_ssh", "running")
                 async with SSHConnection(
@@ -204,16 +273,74 @@ class TestRunner:
                     private_key=self.ssh_key,
                 ) as ssh:
                     await self._log("info", "SSH connected")
+                    await self._emit_status("connect_ssh", "complete")
 
-                    # Get initial GPU status
-                    gpus = await ssh.get_gpu_status()
-                    for gpu in gpus:
+                    if self._cancelled:
+                        await self._log("info", "Test cancelled")
+                        return
+
+                    # Diagnose host
+                    await self._emit_status("diagnose_host", "running")
+                    await self._log("info", "Running host diagnostics...")
+
+                    async def diag_progress(step: str, msg: str):
+                        await self._log("info", f"  [{step}] {msg}")
+
+                    diagnostics_collector = HostDiagnosticsCollector(ssh)
+                    host_diag = await diagnostics_collector.collect_all(progress_callback=diag_progress)
+
+                    # Log summary
+                    if host_diag.shell_functional:
+                        await self._log("info", f"Host: {host_diag.hostname}")
+                        await self._log("info", f"  OS: {host_diag.os_info.distro} {host_diag.os_info.version}")
+                        await self._log("info", f"  Kernel: {host_diag.os_info.kernel}")
+
+                        if host_diag.gpus:
+                            for i, gpu in enumerate(host_diag.gpus):
+                                await self._log(
+                                    "info",
+                                    f"  GPU {i}: {gpu.name} ({gpu.memory_total_mb}MB, {gpu.temperature_c}°C, driver {gpu.driver_version})"
+                                )
+                        else:
+                            await self._log("warning", "  No GPUs detected!")
+
+                        if host_diag.docker.available:
+                            await self._log("info", f"  Docker: {host_diag.docker.version}")
+                        else:
+                            await self._log("warning", f"  Docker: Not available - {host_diag.docker.error}")
+
+                        if host_diag.python.available:
+                            vllm_info = f", vLLM {host_diag.python.vllm_version}" if host_diag.python.vllm_installed else ""
+                            await self._log("info", f"  Python: {host_diag.python.version}{vllm_info}")
+                        else:
+                            await self._log("warning", "  Python: Not available")
+
                         await self._log(
                             "info",
-                            f"GPU: {gpu.name}, {gpu.memory_total_mb}MB, {gpu.temperature_c}C",
+                            f"  Resources: {host_diag.resources.memory_available_gb:.1f}GB RAM, "
+                            f"{host_diag.resources.disk_available_gb:.1f}GB disk available"
                         )
 
-                    await self._emit_status("connect_ssh", "complete")
+                        net_status = []
+                        if host_diag.can_reach_internet:
+                            net_status.append("internet ✓")
+                        else:
+                            net_status.append("internet ✗")
+                        if host_diag.can_reach_huggingface:
+                            net_status.append("huggingface ✓")
+                        else:
+                            net_status.append("huggingface ✗")
+                        await self._log("info", f"  Network: {', '.join(net_status)}")
+
+                        await self._emit_status("diagnose_host", "complete")
+                    else:
+                        await self._log("error", f"Shell not functional: {host_diag.connection_error}")
+                        await self._emit_status("diagnose_host", "failed")
+                        raise Exception(f"Host diagnostics failed: {host_diag.connection_error}")
+
+                    if self._cancelled:
+                        await self._log("info", "Test cancelled")
+                        return
 
                     # Deploy vLLM
                     await self._emit_status("deploy_vllm", "running")
@@ -233,6 +360,10 @@ class TestRunner:
                     await self._log("info", f"vLLM deployed at {deploy_result.endpoint}")
                     await self._emit_status("deploy_vllm", "complete")
 
+                    if self._cancelled:
+                        await self._log("info", "Test cancelled")
+                        return
+
                     # Verify deployment
                     if not self.config.skip_verification:
                         await self._emit_status("verify_deployment", "running")
@@ -244,8 +375,16 @@ class TestRunner:
                         )
 
                         await self._log("info", "Waiting for model to load...")
+
+                        async def log_progress(elapsed: float, message: str):
+                            await self._log("info", f"[{elapsed:.0f}s] {message}")
+
                         try:
-                            await checker.wait_for_ready(timeout=300)
+                            await checker.wait_for_ready(
+                                timeout=300,
+                                interval=10.0,
+                                progress_callback=log_progress,
+                            )
                         except TimeoutError:
                             await self._log("warning", "Model loading timed out")
 
@@ -260,7 +399,89 @@ class TestRunner:
                     else:
                         await self._emit_status("verify_deployment", "skipped")
 
-                # Cleanup
+                    if self._cancelled:
+                        await self._log("info", "Test cancelled")
+                        return
+
+                    # Benchmark (inside SSH context)
+                    await self._emit_status("benchmark", "running")
+                    await self._log("info", "Running benchmark with test prompts...")
+
+                    try:
+                        async with Benchmarker(
+                            ssh=ssh,
+                            api_key=deploy_result.api_key,
+                            model_id=requirements.model_id,
+                        ) as benchmarker:
+                            benchmark_result = await benchmarker.run_benchmark()
+
+                            if benchmark_result.success:
+                                await self._log(
+                                    "info",
+                                    f"Benchmark complete: {benchmark_result.avg_tokens_per_second:.1f} tokens/sec avg, "
+                                    f"TTFT: {benchmark_result.avg_time_to_first_token_ms:.0f}ms"
+                                )
+
+                                # Log individual prompt results
+                                for pr in benchmark_result.prompt_results:
+                                    status = "passed" if pr.matches_expected or pr.matches_expected is None else "failed"
+                                    match_info = ""
+                                    if pr.matches_expected is not None:
+                                        match_info = f" [{'match' if pr.matches_expected else 'no match'}]"
+                                    await self._log(
+                                        "info" if status == "passed" else "warning",
+                                        f"  {pr.prompt_id}: {pr.tokens_per_second:.1f} tps, "
+                                        f"{pr.time_to_first_token_ms:.0f}ms TTFT{match_info}"
+                                    )
+
+                                # Log response quality
+                                if benchmark_result.prompts_with_expected > 0:
+                                    await self._log(
+                                        "info",
+                                        f"Response quality: {benchmark_result.prompts_matching_expected}/{benchmark_result.prompts_with_expected} "
+                                        f"prompts matched expected ({benchmark_result.match_rate*100:.0f}%)"
+                                    )
+
+                                if benchmark_result.throughput_tokens_per_second > 0:
+                                    await self._log(
+                                        "info",
+                                        f"Throughput test: {benchmark_result.throughput_tokens_per_second:.1f} tokens/sec"
+                                    )
+
+                                # Save benchmark to store
+                                try:
+                                    store = BenchmarkStore()
+                                    record = create_benchmark_record(
+                                        session_id=session.id,
+                                        model_id=requirements.model_id,
+                                        quantization=self.config.quantization,
+                                        provider=session.provider,
+                                        gpu_type=session.gpu_type,
+                                        gpu_count=session.gpu_count,
+                                        gpu_vram_mb=0,  # TODO: get from diagnostics
+                                        price_per_hour=session.price_per_hour,
+                                        benchmark_result=benchmark_result,
+                                    )
+                                    store.save(record)
+                                    await self._log(
+                                        "info",
+                                        f"Benchmark saved: {record.id} "
+                                        f"({record.tokens_per_dollar:.1f} tokens/$/hr, "
+                                        f"${record.cost_per_million_tokens:.4f}/1M tokens)"
+                                    )
+                                except Exception as e:
+                                    await self._log("warning", f"Failed to save benchmark: {e}")
+
+                                await self._emit_status("benchmark", "complete")
+                            else:
+                                await self._log("warning", f"Benchmark had failures: {benchmark_result.error}")
+                                await self._emit_status("benchmark", "complete")
+
+                    except Exception as e:
+                        await self._log("warning", f"Benchmark failed: {e}")
+                        await self._emit_status("benchmark", "failed")
+
+                # Cleanup (outside SSH context - uses shopper client, not SSH)
                 if self.config.auto_cleanup:
                     await self._emit_status("cleanup", "running")
                     await self._log("info", "Cleaning up session...")
@@ -284,8 +505,9 @@ class TestRunner:
                 try:
                     async with ShopperClient(self.shopper_url) as client:
                         await client.force_destroy(self.session_id)
-                except Exception:
-                    pass
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup session {self.session_id}: {cleanup_error}")
+                    await self._log("warning", f"Session cleanup failed: {cleanup_error}")
 
     async def _emit_status(self, step: str, status: str) -> None:
         """Emit step status event."""
@@ -302,7 +524,10 @@ class TestRunner:
         await broadcast_event(event)
 
     async def _log(self, level: str, message: str) -> None:
-        """Emit log event."""
+        """Emit log event and print to console."""
+        # Print to console for debugging
+        print(f"[TEST][{level.upper()}] {message}")
+
         event = WebSocketEvent(
             type=EventType.LOG,
             data={"level": level, "message": message},
@@ -337,19 +562,29 @@ class TestRunner:
 
 async def broadcast_event(event: WebSocketEvent) -> None:
     """Broadcast event to all connected WebSocket clients."""
+    async with _get_connections_lock():
+        connections_snapshot = set(_active_connections)
+
     disconnected = set()
-    for ws in _active_connections:
+    for ws in connections_snapshot:
         try:
             await ws.send_text(event.to_json())
         except Exception:
             disconnected.add(ws)
 
-    _active_connections.difference_update(disconnected)
+    if disconnected:
+        async with _get_connections_lock():
+            # Use discard() to safely handle concurrent modifications
+            for ws in disconnected:
+                _active_connections.discard(ws)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan context."""
+    global _test_lock, _connections_lock
+    _test_lock = asyncio.Lock()
+    _connections_lock = asyncio.Lock()
     logger.info(f"Starting GPU Deploy LLM Dashboard v{__version__}")
     yield
     logger.info("Shutting down dashboard")
@@ -366,10 +601,13 @@ app = FastAPI(
 async def get_dashboard():
     """Serve the dashboard HTML."""
     static_path = Path(__file__).parent / "static" / "index.html"
-    if static_path.exists():
-        return HTMLResponse(static_path.read_text())
+    try:
+        if static_path.exists():
+            return HTMLResponse(static_path.read_text())
+    except IOError as e:
+        logger.warning(f"Failed to read dashboard HTML: {e}")
 
-    # Fallback inline HTML if static file missing
+    # Fallback inline HTML if static file missing or read failed
     return HTMLResponse(get_inline_dashboard())
 
 
@@ -392,15 +630,15 @@ async def get_status():
                 health = await client.health_check()
                 status["shopper"]["healthy"] = True
                 status["shopper"]["status"] = health.status
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Health check failed: {e}")
 
             # Ready check
             try:
                 ready = await client.ready_check()
                 status["shopper"]["ready"] = ready.ready
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Ready check failed: {e}")
 
             # Get inventory counts per provider
             try:
@@ -411,17 +649,18 @@ async def get_status():
                         providers[offer.provider] = 0
                     providers[offer.provider] += 1
                 status["providers"] = providers
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Inventory check failed: {e}")
 
     except Exception as e:
         status["error"] = str(e)
 
-    if _current_test:
-        status["current_test"] = {
-            "session_id": _current_test.session_id,
-            "current_step": _current_test.current_step,
-        }
+    async with _get_test_lock():
+        if _current_test:
+            status["current_test"] = {
+                "session_id": _current_test.session_id,
+                "current_step": _current_test.current_step,
+            }
 
     return JSONResponse(status)
 
@@ -443,7 +682,7 @@ async def get_models():
 
 
 @app.get("/api/sessions")
-async def get_sessions(limit: int = 50):
+async def get_sessions(limit: int = Query(default=50, ge=1, le=500)):
     """Get session history from the shopper.
 
     Returns sessions created by gpu-deploy-llm, newest first.
@@ -480,18 +719,115 @@ async def get_sessions(limit: int = 50):
         return JSONResponse({"sessions": [], "error": str(e)})
 
 
+@app.get("/api/benchmarks")
+async def get_benchmarks(
+    model_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    gpu_type: Optional[str] = None,
+    limit: int = 50,
+):
+    """Get benchmark history.
+
+    Args:
+        model_id: Filter by model
+        provider: Filter by provider
+        gpu_type: Filter by GPU type
+        limit: Max results
+    """
+    try:
+        store = BenchmarkStore()
+        results = store.list(
+            model_id=model_id,
+            provider=provider,
+            gpu_type=gpu_type,
+            limit=limit,
+        )
+        return JSONResponse({"benchmarks": results, "count": len(results)})
+    except Exception as e:
+        logger.error(f"Failed to fetch benchmarks: {e}")
+        return JSONResponse({"benchmarks": [], "error": str(e)})
+
+
+@app.get("/api/benchmarks/{benchmark_id}")
+async def get_benchmark(benchmark_id: str):
+    """Get a specific benchmark record with full details."""
+    try:
+        store = BenchmarkStore()
+        record = store.get(benchmark_id)
+        if not record:
+            raise HTTPException(404, "Benchmark not found")
+        return JSONResponse(record.to_dict())
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch benchmark: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/benchmarks/compare/{model_id}")
+async def compare_benchmarks(model_id: str):
+    """Get performance comparison across GPU types for a model."""
+    try:
+        store = BenchmarkStore()
+        comparison = store.get_comparison(model_id)
+        return JSONResponse(comparison)
+    except Exception as e:
+        logger.error(f"Failed to compare benchmarks: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/benchmarks/recommend/{model_id}")
+async def recommend_config(
+    model_id: str,
+    optimize_for: str = "balanced",  # cost, speed, balanced
+    max_price: Optional[float] = None,
+):
+    """Get recommended configuration for a model based on historical benchmarks.
+
+    Args:
+        model_id: Model to get recommendation for
+        optimize_for: "cost" (best value), "speed" (fastest), or "balanced"
+        max_price: Optional maximum price per hour
+    """
+    try:
+        store = BenchmarkStore()
+        recommendation = store.get_best_config(
+            model_id=model_id,
+            optimize_for=optimize_for,
+            max_price=max_price,
+        )
+        if not recommendation:
+            return JSONResponse({
+                "recommendation": None,
+                "message": f"No benchmark data for model {model_id}",
+            })
+        return JSONResponse(recommendation)
+    except Exception as e:
+        logger.error(f"Failed to get recommendation: {e}")
+        raise HTTPException(500, str(e))
+
+
 @app.post("/api/test/run")
 async def run_test(config: TestConfig):
     """Start a deployment test."""
-    global _current_test
+    global _current_test, _current_task
 
-    if _current_test and not _current_test.passed and not _current_test.error:
-        raise HTTPException(400, "Test already running")
+    async with _get_test_lock():
+        if _current_test and not _current_test.passed and not _current_test.error:
+            raise HTTPException(400, "Test already running")
 
-    _current_test = TestRunner(config, _shopper_url, _debug)
+        _current_test = TestRunner(config, _shopper_url, _debug)
+        _current_task = asyncio.create_task(_current_test.run())
 
-    # Run test in background
-    asyncio.create_task(_current_test.run())
+        def _task_done_callback(t: asyncio.Task) -> None:
+            try:
+                exc = t.exception()
+                if exc:
+                    logger.error(f"Test task failed: {exc}")
+            except asyncio.CancelledError:
+                logger.info("Test task was cancelled")
+
+        _current_task.add_done_callback(_task_done_callback)
 
     return JSONResponse({"status": "started", "model": config.model_id})
 
@@ -499,11 +835,15 @@ async def run_test(config: TestConfig):
 @app.post("/api/test/stop")
 async def stop_test():
     """Stop the current test."""
-    global _current_test
+    global _current_test, _current_task
 
-    if _current_test:
-        _current_test._cancelled = True
+    async with _get_test_lock():
+        if _current_test:
+            _current_test._cancelled = True
+        if _current_task and not _current_task.done():
+            _current_task.cancel()
         _current_test = None
+        _current_task = None
 
     return JSONResponse({"status": "stopped"})
 
@@ -524,42 +864,114 @@ async def cleanup_session(request: CleanupRequest):
 
     # Determine which session to cleanup
     target_session_id = request.session_id
-    if not target_session_id and _current_test:
-        target_session_id = _current_test.session_id
+    async with _get_test_lock():
+        if not target_session_id and _current_test:
+            target_session_id = _current_test.session_id
 
     if not target_session_id:
         raise HTTPException(400, "No session to cleanup")
+
+    cleanup_status = "cleanup_initiated"
+    error_message = None
 
     try:
         async with ShopperClient(_shopper_url, debug=_debug) as client:
             # Try force destroy first for faster cleanup
             await client.force_destroy(target_session_id)
-
-            # Emit cleanup event
-            event = WebSocketEvent(
-                type=EventType.LOG,
-                data={"level": "info", "message": f"Session {target_session_id[:12]}... cleanup initiated"},
-            )
-            await broadcast_event(event)
-
-            return JSONResponse({
-                "status": "cleanup_initiated",
-                "session_id": target_session_id
-            })
     except Exception as e:
-        raise HTTPException(500, f"Cleanup failed: {str(e)}")
+        # Log the error but don't fail - the session might already be gone
+        error_message = str(e)
+        cleanup_status = "cleanup_attempted"
+        logger.warning(f"Cleanup request for {target_session_id} had error: {e}")
+
+    # Always clear local state and emit event
+    async with _get_test_lock():
+        if _current_test and _current_test.session_id == target_session_id:
+            _current_test = None
+
+    # Emit cleanup event
+    msg = f"Session {target_session_id[:12]}... cleanup initiated"
+    if error_message:
+        msg += f" (warning: {error_message})"
+
+    event = WebSocketEvent(
+        type=EventType.LOG,
+        data={"level": "info" if not error_message else "warning", "message": msg},
+    )
+    await broadcast_event(event)
+
+    return JSONResponse({
+        "status": cleanup_status,
+        "session_id": target_session_id,
+        "error": error_message
+    })
+
+
+@app.post("/api/session/dismiss")
+async def dismiss_session(request: CleanupRequest):
+    """Dismiss a session from local tracking without cleanup.
+
+    Use this when a session is stuck/phantom and cleanup fails.
+    """
+    global _current_test
+
+    target_session_id = request.session_id
+    if not target_session_id:
+        raise HTTPException(400, "No session_id provided")
+
+    # Clear local state
+    async with _get_test_lock():
+        if _current_test and _current_test.session_id == target_session_id:
+            _current_test = None
+
+    # Emit dismissal event
+    event = WebSocketEvent(
+        type=EventType.LOG,
+        data={"level": "info", "message": f"Session {target_session_id[:12]}... dismissed from tracking"},
+    )
+    await broadcast_event(event)
+
+    # Also emit a session update to mark it as dismissed
+    event = WebSocketEvent(
+        type=EventType.SESSION,
+        data={
+            "id": target_session_id,
+            "status": "dismissed",
+            "provider": "",
+            "gpu_type": "",
+            "gpu_count": 0,
+            "price_per_hour": 0,
+        },
+    )
+    await broadcast_event(event)
+
+    return JSONResponse({
+        "status": "dismissed",
+        "session_id": target_session_id
+    })
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time events."""
+    # Check connection limit outside the lock to minimize lock hold time
+    async with _get_connections_lock():
+        if len(_active_connections) >= MAX_WEBSOCKET_CONNECTIONS:
+            await websocket.close(code=1013)  # Try Again Later
+            return
+
+    # Accept WebSocket outside the lock (I/O operation)
     await websocket.accept()
-    _active_connections.add(websocket)
+
+    # Add to connections under lock
+    async with _get_connections_lock():
+        _active_connections.add(websocket)
 
     try:
-        # Send initial status
-        status = await get_status()
-        await websocket.send_json({"type": "init", "status": status.body.decode()})
+        # Send initial status - send as dict directly to avoid double-encoding
+        status_response = await get_status()
+        status_data = json.loads(status_response.body.decode())
+        await websocket.send_json({"type": "init", "status": status_data})
 
         # Keep connection alive
         while True:
@@ -575,7 +987,8 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        _active_connections.discard(websocket)
+        async with _get_connections_lock():
+            _active_connections.discard(websocket)
 
 
 def get_inline_dashboard() -> str:

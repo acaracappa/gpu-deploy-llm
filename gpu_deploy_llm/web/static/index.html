@@ -57,6 +57,36 @@
         }
         .btn:hover { opacity: 0.9; transform: translateY(-1px); }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+        .btn-secondary { background: var(--bg-card); color: var(--text-primary); }
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 8px;
+        }
+        .tab {
+            background: transparent;
+            color: var(--text-secondary);
+            border: 2px solid var(--bg-card);
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 1rem;
+            transition: all 0.2s ease;
+        }
+        .tab:hover {
+            background: var(--bg-card);
+            color: var(--text-primary);
+            border-color: var(--text-secondary);
+        }
+        .tab.active {
+            background: var(--accent);
+            color: var(--bg-primary);
+            border-color: var(--accent);
+            box-shadow: 0 2px 8px rgba(0, 217, 255, 0.3);
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
         @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
         .card {
@@ -88,6 +118,9 @@
         .config-row { display: flex; gap: 10px; margin-bottom: 10px; }
         .config-row > div { flex: 1; }
         .config-row label { display: block; font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 4px; }
+        .config-field { margin-bottom: 12px; }
+        .config-field label { display: block; font-size: 0.75rem; color: var(--text-secondary); margin-bottom: 4px; }
+        .config-field select, .config-field input { width: 100%; }
         select, input {
             background: var(--bg-card);
             border: 1px solid transparent;
@@ -112,7 +145,9 @@
             background: var(--bg-primary);
             border-radius: 6px;
             padding: 12px;
-            height: 280px;
+            height: calc(100vh - 220px);
+            min-height: 400px;
+            max-height: 600px;
             overflow-y: auto;
             font-family: 'SF Mono', 'Consolas', monospace;
             font-size: 0.8rem;
@@ -153,19 +188,42 @@
         .btn-small:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-small.btn-danger { background: var(--error); }
         .btn-small.btn-warning { background: var(--warning); color: var(--bg-primary); }
+        .btn-small.btn-secondary { background: var(--bg-card); color: var(--text-primary); }
         .action-text { font-size: 0.8rem; font-weight: normal; color: var(--text-secondary); }
         .connection-status { font-size: 0.75rem; color: var(--text-secondary); }
         .connection-status.connected { color: var(--success); }
         .connection-status.disconnected { color: var(--error); }
+        .test-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid var(--bg-card);
+        }
+        .config-progress-row {
+            display: flex;
+            gap: 20px;
+        }
+        .config-column {
+            flex: 1;
+            min-width: 0;
+        }
+        .progress-column {
+            flex: 1;
+            min-width: 0;
+            padding-left: 20px;
+            border-left: 1px solid var(--bg-card);
+        }
+        .progress-column h2 {
+            margin-bottom: 12px;
+        }
         /* Session Log styles */
         .session-log { margin-bottom: 20px; }
         .session-log-list { display: flex; flex-direction: column; gap: 8px; }
         .session-log-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
             background: var(--bg-primary);
-            padding: 10px 12px;
+            padding: 12px;
             border-radius: 6px;
             font-size: 0.85rem;
         }
@@ -173,7 +231,13 @@
         .session-log-item.success { border-left: 3px solid var(--success); }
         .session-log-item.failed { border-left: 3px solid var(--error); }
         .session-log-item.stopped { border-left: 3px solid var(--text-secondary); }
-        .session-log-info { display: flex; align-items: center; gap: 12px; flex: 1; }
+        .session-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        .session-log-info { display: flex; align-items: center; gap: 12px; }
         .session-log-id { font-family: monospace; font-size: 0.8rem; color: var(--accent); }
         .session-log-meta { display: flex; gap: 15px; color: var(--text-secondary); font-size: 0.8rem; }
         .session-log-meta span { display: flex; align-items: center; gap: 4px; }
@@ -191,6 +255,28 @@
         .session-log-status.success { background: rgba(0, 255, 136, 0.2); color: var(--success); }
         .session-log-actions { display: flex; gap: 6px; }
         .session-log-empty { color: var(--text-secondary); font-size: 0.85rem; text-align: center; padding: 20px; }
+        /* Benchmark metrics in session */
+        .session-benchmark {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--bg-card);
+        }
+        .bench-metric {
+            text-align: center;
+        }
+        .bench-metric-value {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+        .bench-metric-label {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }
         .pagination {
             display: flex;
             align-items: center;
@@ -212,120 +298,229 @@
         .pagination button:disabled { opacity: 0.3; cursor: not-allowed; }
         .pagination button:disabled:hover { background: var(--bg-card); color: var(--text-primary); }
         .pagination-info { color: var(--text-secondary); }
+        /* Benchmarks page styles */
+        .benchmark-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+        .benchmark-table th, .benchmark-table td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--bg-card);
+        }
+        .benchmark-table th {
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+        }
+        .benchmark-table tr:hover td {
+            background: var(--bg-card);
+        }
+        .benchmark-value { font-family: monospace; }
+        .benchmark-value.highlight { color: var(--success); font-weight: 600; }
+        .comparison-card {
+            background: var(--bg-primary);
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+        }
+        .comparison-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .comparison-gpu { font-weight: 600; color: var(--accent); }
+        .comparison-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+        }
+        .stat-box { text-align: center; }
+        .stat-value { font-size: 1.2rem; font-weight: 600; color: var(--text-primary); }
+        .stat-label { font-size: 0.7rem; color: var(--text-secondary); text-transform: uppercase; }
+        .no-data { color: var(--text-secondary); text-align: center; padding: 40px; }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>GPU Deploy LLM</h1>
-        <div class="header-actions">
-            <span class="connection-status" id="connectionStatus">Connecting...</span>
-            <button class="btn" id="runBtn" onclick="runTest()">Run Test ▶</button>
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('dashboard')">Dashboard</button>
+            <button class="tab" onclick="showTab('sessions')">Sessions</button>
+            <button class="tab" onclick="showTab('benchmarks')">Benchmarks</button>
         </div>
     </div>
 
-    <div class="result-banner" id="resultBanner">
-        <div id="resultText"></div>
-        <div class="error-actions" id="errorActions" style="display: none;">
-            <span class="action-text">Session may still be active:</span>
-            <button class="btn-small btn-danger" onclick="cleanupSession()">Cleanup Now</button>
-            <button class="btn-small btn-warning" onclick="dismissError()">Leave Running</button>
+    <!-- Dashboard Tab -->
+    <div id="dashboardTab" class="tab-content active">
+        <div class="result-banner" id="resultBanner">
+            <div id="resultText"></div>
+            <div class="error-actions" id="errorActions" style="display: none;">
+                <span class="action-text">Session may still be active:</span>
+                <button class="btn-small btn-danger" onclick="cleanupSession()">Cleanup Now</button>
+                <button class="btn-small btn-warning" onclick="dismissError()">Leave Running</button>
+            </div>
         </div>
-    </div>
 
-    <div class="grid">
-        <!-- Left Column: Status + Config -->
-        <div class="card">
-            <div class="section">
-                <h2>Service Status</h2>
-                <div class="status-row">
-                    <span class="status-dot gray" id="shopperDot"></span>
-                    <span>Shopper: <strong id="shopperStatus">Checking...</strong></span>
-                </div>
-                <div class="providers">
-                    <div class="provider">
-                        <span class="status-dot gray" id="vastaiDot"></span>
-                        <span>Vast.ai: <span id="vastaiStatus">-</span></span>
+        <div class="grid">
+            <!-- Left Column: Status + Config + Progress -->
+            <div class="card">
+                <div class="section">
+                    <h2>Service Status</h2>
+                    <div class="status-row">
+                        <span class="status-dot gray" id="shopperDot"></span>
+                        <span>Shopper: <strong id="shopperStatus">Checking...</strong></span>
                     </div>
-                    <div class="provider">
-                        <span class="status-dot gray" id="tensordockDot"></span>
-                        <span>TensorDock: <span id="tensordockStatus">-</span></span>
+                    <div class="providers">
+                        <div class="provider">
+                            <span class="status-dot gray" id="vastaiDot"></span>
+                            <span>Vast.ai: <span id="vastaiStatus">-</span></span>
+                        </div>
+                        <div class="provider">
+                            <span class="status-dot gray" id="tensordockDot"></span>
+                            <span>TensorDock: <span id="tensordockStatus">-</span></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section config-progress-row">
+                    <div class="config-column">
+                        <h2>Test Configuration</h2>
+                        <div class="config-field">
+                            <label>Model</label>
+                            <select id="modelSelect">
+                                <option value="TinyLlama/TinyLlama-1.1B-Chat-v1.0">TinyLlama 1.1B</option>
+                                <option value="microsoft/phi-2">Phi-2</option>
+                                <option value="Qwen/Qwen2-1.5B-Instruct">Qwen2 1.5B</option>
+                                <option value="mistralai/Mistral-7B-Instruct-v0.2">Mistral 7B</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
+                            <label>Provider</label>
+                            <select id="providerSelect">
+                                <option value="">Any</option>
+                                <option value="vastai">Vast.ai</option>
+                                <option value="tensordock">TensorDock</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
+                            <label>Quantization</label>
+                            <select id="quantSelect">
+                                <option value="none">FP16</option>
+                                <option value="awq">AWQ 4-bit</option>
+                                <option value="gptq">GPTQ 4-bit</option>
+                            </select>
+                        </div>
+                        <div class="config-field">
+                            <label>Max $/hr</label>
+                            <input type="number" id="maxPrice" value="0.50" step="0.05" min="0.10" max="5.00">
+                        </div>
+                        <div class="test-actions">
+                            <span class="connection-status" id="connectionStatus">Connecting...</span>
+                            <button class="btn" id="runBtn" onclick="runTest()">Run Test ▶</button>
+                        </div>
+                    </div>
+
+                    <div class="progress-column">
+                        <h2>Test Progress</h2>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressBar" style="width: 0%"></div>
+                        </div>
+                        <div id="steps">
+                            <div class="step pending" data-step="calculate_requirements"><span class="step-icon"></span>Calculate requirements</div>
+                            <div class="step pending" data-step="query_inventory"><span class="step-icon"></span>Query inventory</div>
+                            <div class="step pending" data-step="select_offer"><span class="step-icon"></span>Select offer</div>
+                            <div class="step pending" data-step="create_session"><span class="step-icon"></span>Create session</div>
+                            <div class="step pending" data-step="wait_for_running"><span class="step-icon"></span>Wait for running</div>
+                            <div class="step pending" data-step="connect_ssh"><span class="step-icon"></span>Connect SSH</div>
+                            <div class="step pending" data-step="diagnose_host"><span class="step-icon"></span>Diagnose host</div>
+                            <div class="step pending" data-step="deploy_vllm"><span class="step-icon"></span>Install & start vLLM</div>
+                            <div class="step pending" data-step="verify_deployment"><span class="step-icon"></span>Verify deployment</div>
+                            <div class="step pending" data-step="benchmark"><span class="step-icon"></span>Benchmark</div>
+                            <div class="step pending" data-step="cleanup"><span class="step-icon"></span>Cleanup</div>
+                        </div>
                     </div>
                 </div>
             </div>
 
-            <div class="section">
-                <h2>Test Configuration</h2>
+            <!-- Right Column: Live Logs -->
+            <div class="card">
+                <h2>Live Logs</h2>
+                <div class="logs" id="logs"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sessions Tab -->
+    <div id="sessionsTab" class="tab-content">
+        <div class="card session-log">
+            <h2>Session Log</h2>
+            <div class="session-log-list" id="sessionLogList">
+                <div class="session-log-empty">No sessions yet. Run a test to see sessions here.</div>
+            </div>
+            <div class="pagination" id="sessionPagination" style="display: none;">
+                <button onclick="prevSessionPage()" id="prevPageBtn" disabled>← Prev</button>
+                <span class="pagination-info" id="paginationInfo">1 of 1</span>
+                <button onclick="nextSessionPage()" id="nextPageBtn" disabled>Next →</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Benchmarks Tab -->
+    <div id="benchmarksTab" class="tab-content">
+        <div class="grid">
+            <div class="card">
+                <h2>Benchmark History</h2>
+                <div id="benchmarkList">
+                    <div class="no-data">Loading benchmarks...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Performance Comparison</h2>
                 <div class="config-row">
                     <div>
-                        <label>Model</label>
-                        <select id="modelSelect">
+                        <label>Compare Model</label>
+                        <select id="compareModelSelect" onchange="loadComparison()">
                             <option value="TinyLlama/TinyLlama-1.1B-Chat-v1.0">TinyLlama 1.1B</option>
                             <option value="microsoft/phi-2">Phi-2</option>
                             <option value="Qwen/Qwen2-1.5B-Instruct">Qwen2 1.5B</option>
                             <option value="mistralai/Mistral-7B-Instruct-v0.2">Mistral 7B</option>
                         </select>
                     </div>
-                    <div>
-                        <label>Provider</label>
-                        <select id="providerSelect">
-                            <option value="">Any</option>
-                            <option value="vastai">Vast.ai</option>
-                            <option value="tensordock">TensorDock</option>
-                        </select>
-                    </div>
                 </div>
-                <div class="config-row">
-                    <div>
-                        <label>Quantization</label>
-                        <select id="quantSelect">
-                            <option value="none">FP16</option>
-                            <option value="awq">AWQ 4-bit</option>
-                            <option value="gptq">GPTQ 4-bit</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label>Max $/hr</label>
-                        <input type="number" id="maxPrice" value="0.50" step="0.05" min="0.10" max="5.00">
-                    </div>
+                <div id="comparisonResults">
+                    <div class="no-data">Select a model to compare GPU performance</div>
                 </div>
             </div>
         </div>
 
-        <!-- Right Column: Progress -->
         <div class="card">
-            <h2>Test Progress</h2>
-            <div class="progress-bar">
-                <div class="progress-fill" id="progressBar" style="width: 0%"></div>
+            <h2>All Benchmarks</h2>
+            <div style="overflow-x: auto;">
+                <table class="benchmark-table" id="benchmarkTable">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Model</th>
+                            <th>GPU</th>
+                            <th>Provider</th>
+                            <th>Tokens/sec</th>
+                            <th>TTFT</th>
+                            <th>$/hr</th>
+                            <th>Tokens/$</th>
+                            <th>$/1M tokens</th>
+                        </tr>
+                    </thead>
+                    <tbody id="benchmarkTableBody">
+                        <tr><td colspan="9" class="no-data">No benchmarks recorded yet</td></tr>
+                    </tbody>
+                </table>
             </div>
-            <div id="steps">
-                <div class="step pending" data-step="calculate_requirements"><span class="step-icon"></span>Calculate requirements</div>
-                <div class="step pending" data-step="query_inventory"><span class="step-icon"></span>Query inventory</div>
-                <div class="step pending" data-step="select_offer"><span class="step-icon"></span>Select offer</div>
-                <div class="step pending" data-step="create_session"><span class="step-icon"></span>Create session</div>
-                <div class="step pending" data-step="wait_for_running"><span class="step-icon"></span>Wait for running</div>
-                <div class="step pending" data-step="connect_ssh"><span class="step-icon"></span>Connect SSH</div>
-                <div class="step pending" data-step="deploy_vllm"><span class="step-icon"></span>Install & start vLLM</div>
-                <div class="step pending" data-step="verify_deployment"><span class="step-icon"></span>Verify deployment</div>
-                <div class="step pending" data-step="cleanup"><span class="step-icon"></span>Cleanup</div>
-            </div>
         </div>
-    </div>
-
-    <div class="card session-log">
-        <h2>Session Log</h2>
-        <div class="session-log-list" id="sessionLogList">
-            <div class="session-log-empty">No sessions yet. Run a test to see sessions here.</div>
-        </div>
-        <div class="pagination" id="sessionPagination" style="display: none;">
-            <button onclick="prevSessionPage()" id="prevPageBtn" disabled>← Prev</button>
-            <span class="pagination-info" id="paginationInfo">1 of 1</span>
-            <button onclick="nextSessionPage()" id="nextPageBtn" disabled>Next →</button>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>Live Logs</h2>
-        <div class="logs" id="logs"></div>
     </div>
 
     <script>
@@ -336,9 +531,27 @@
 
         // Session log state
         let sessionLog = [];
+        let benchmarksBySession = {};
         const SESSIONS_PER_PAGE = 5;
         let sessionPage = 0;
-        let sessionRefreshInterval = null;
+
+        // Benchmarks state
+        let allBenchmarks = [];
+
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+
+            document.querySelector(`.tab[onclick="showTab('${tabName}')"]`).classList.add('active');
+            document.getElementById(tabName + 'Tab').classList.add('active');
+
+            if (tabName === 'sessions') {
+                fetchSessions();
+                fetchBenchmarks();
+            } else if (tabName === 'benchmarks') {
+                loadBenchmarks();
+            }
+        }
 
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -402,7 +615,6 @@
         function updateSession(data) {
             currentSessionId = data.id;
 
-            // Find existing session in log or add new one
             const existingIdx = sessionLog.findIndex(s => s.id === data.id);
             const existingSession = existingIdx >= 0 ? sessionLog[existingIdx] : null;
 
@@ -416,15 +628,15 @@
                 ssh_host: data.ssh_host,
                 ssh_port: data.ssh_port,
                 timestamp: existingSession?.timestamp || new Date().toISOString(),
-                result: existingSession?.result || null // Preserve result state
+                result: existingSession?.result || null,
+                benchmark: existingSession?.benchmark || null
             };
 
             if (existingIdx >= 0) {
                 sessionLog[existingIdx] = sessionData;
             } else {
-                // Add to beginning (newest first)
                 sessionLog.unshift(sessionData);
-                sessionPage = 0; // Jump to first page when new session added
+                sessionPage = 0;
             }
 
             renderSessionLog();
@@ -450,13 +662,11 @@
                 return;
             }
 
-            // Calculate pagination
             const totalPages = Math.ceil(sessionLog.length / SESSIONS_PER_PAGE);
             const startIdx = sessionPage * SESSIONS_PER_PAGE;
             const endIdx = Math.min(startIdx + SESSIONS_PER_PAGE, sessionLog.length);
             const pageItems = sessionLog.slice(startIdx, endIdx);
 
-            // Render items
             list.innerHTML = pageItems.map(session => {
                 const isActive = session.id === currentSessionId && !session.result;
                 const statusClass = session.result || (isActive ? 'active' : session.status);
@@ -464,29 +674,56 @@
                                      session.result === 'failed' ? 'failed' : session.status;
 
                 const time = new Date(session.timestamp).toLocaleTimeString();
-                const date = new Date(session.timestamp).toLocaleDateString();
+                const bench = benchmarksBySession[session.id];
+
+                let benchmarkHtml = '';
+                if (bench) {
+                    benchmarkHtml = `
+                        <div class="session-benchmark">
+                            <div class="bench-metric">
+                                <div class="bench-metric-value">${bench.avg_tokens_per_second?.toFixed(1) || '-'}</div>
+                                <div class="bench-metric-label">Tokens/sec</div>
+                            </div>
+                            <div class="bench-metric">
+                                <div class="bench-metric-value">${bench.avg_time_to_first_token_ms?.toFixed(0) || '-'}ms</div>
+                                <div class="bench-metric-label">TTFT</div>
+                            </div>
+                            <div class="bench-metric">
+                                <div class="bench-metric-value">${bench.tokens_per_dollar?.toFixed(1) || '-'}</div>
+                                <div class="bench-metric-label">Tokens/$</div>
+                            </div>
+                            <div class="bench-metric">
+                                <div class="bench-metric-value">${(bench.match_rate * 100)?.toFixed(0) || '-'}%</div>
+                                <div class="bench-metric-label">Quality</div>
+                            </div>
+                        </div>
+                    `;
+                }
 
                 return `
                     <div class="session-log-item ${statusClass}">
-                        <div class="session-log-info">
-                            <span class="session-log-id">${session.id.substring(0, 12)}...</span>
-                            <div class="session-log-meta">
-                                <span>${session.provider}</span>
-                                <span>${session.gpu_type} x${session.gpu_count}</span>
-                                <span>$${session.price_per_hour?.toFixed(3) || '0.00'}/hr</span>
-                                <span>${time}</span>
+                        <div class="session-header">
+                            <div class="session-log-info">
+                                <span class="session-log-id">${session.id.substring(0, 12)}...</span>
+                                <div class="session-log-meta">
+                                    <span>${session.provider}</span>
+                                    <span>${session.gpu_type} x${session.gpu_count}</span>
+                                    <span>$${session.price_per_hour?.toFixed(3) || '0.00'}/hr</span>
+                                    <span>${time}</span>
+                                </div>
+                            </div>
+                            <div class="session-log-actions">
+                                <span class="session-log-status ${statusClass}">${displayStatus}</span>
+                                ${!session.result && session.status !== 'stopped' ?
+                                    `<button class="btn-small btn-danger" onclick="cleanupSessionById('${session.id}')">Cleanup</button>
+                                     <button class="btn-small btn-secondary" onclick="dismissSessionById('${session.id}')" title="Remove from list without cleanup">Dismiss</button>` : ''}
                             </div>
                         </div>
-                        <div class="session-log-actions">
-                            <span class="session-log-status ${statusClass}">${displayStatus}</span>
-                            ${!session.result && session.status !== 'stopped' ?
-                                `<button class="btn-small btn-danger" onclick="cleanupSessionById('${session.id}')">Cleanup</button>` : ''}
-                        </div>
+                        ${benchmarkHtml}
                     </div>
                 `;
             }).join('');
 
-            // Update pagination
             if (totalPages > 1) {
                 pagination.style.display = 'flex';
                 document.getElementById('paginationInfo').textContent = `${sessionPage + 1} of ${totalPages}`;
@@ -498,49 +735,66 @@
         }
 
         function prevSessionPage() {
-            if (sessionPage > 0) {
-                sessionPage--;
-                renderSessionLog();
-            }
+            if (sessionPage > 0) { sessionPage--; renderSessionLog(); }
         }
 
         function nextSessionPage() {
             const totalPages = Math.ceil(sessionLog.length / SESSIONS_PER_PAGE);
-            if (sessionPage < totalPages - 1) {
-                sessionPage++;
-                renderSessionLog();
-            }
+            if (sessionPage < totalPages - 1) { sessionPage++; renderSessionLog(); }
         }
 
         async function cleanupSessionById(sessionId) {
             addLog('info', `Initiating cleanup for session ${sessionId.substring(0, 12)}...`);
-
             try {
                 const resp = await fetch('/api/session/cleanup', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({session_id: sessionId})
                 });
-
+                const data = await resp.json();
                 if (resp.ok) {
-                    addLog('info', 'Cleanup initiated successfully');
-                    // Update session in log
-                    const session = sessionLog.find(s => s.id === sessionId);
-                    if (session) {
-                        session.status = 'stopped';
-                        session.result = 'stopped';
-                        renderSessionLog();
+                    if (data.error) {
+                        addLog('warning', `Cleanup attempted with warning: ${data.error}`);
+                    } else {
+                        addLog('info', 'Cleanup initiated successfully');
                     }
+                    const session = sessionLog.find(s => s.id === sessionId);
+                    if (session) { session.status = 'stopped'; session.result = 'stopped'; renderSessionLog(); }
+                    if (sessionId === currentSessionId) {
+                        currentSessionId = null;
+                        document.getElementById('errorActions').style.display = 'none';
+                    }
+                } else {
+                    addLog('error', `Cleanup failed: ${data.detail || 'Unknown error'}`);
+                }
+            } catch (e) {
+                addLog('error', `Cleanup request failed: ${e.message}`);
+            }
+        }
+
+        async function dismissSessionById(sessionId) {
+            addLog('info', `Dismissing session ${sessionId.substring(0, 12)}...`);
+            try {
+                const resp = await fetch('/api/session/dismiss', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session_id: sessionId})
+                });
+                if (resp.ok) {
+                    addLog('info', 'Session dismissed from tracking');
+                    // Remove from local session log
+                    sessionLog = sessionLog.filter(s => s.id !== sessionId);
+                    renderSessionLog();
                     if (sessionId === currentSessionId) {
                         currentSessionId = null;
                         document.getElementById('errorActions').style.display = 'none';
                     }
                 } else {
                     const err = await resp.json();
-                    addLog('error', `Cleanup failed: ${err.detail || 'Unknown error'}`);
+                    addLog('error', `Dismiss failed: ${err.detail || 'Unknown error'}`);
                 }
             } catch (e) {
-                addLog('error', `Cleanup request failed: ${e.message}`);
+                addLog('error', `Dismiss request failed: ${e.message}`);
             }
         }
 
@@ -553,7 +807,6 @@
             const resultText = document.getElementById('resultText');
             const errorActions = document.getElementById('errorActions');
 
-            // Update session log
             if (currentSessionId) {
                 updateSessionResult(currentSessionId, data.passed, data.error);
             }
@@ -563,11 +816,12 @@
                 banner.className = 'result-banner success';
                 resultText.textContent = '✓ Test PASSED';
                 errorActions.style.display = 'none';
+                // Refresh benchmarks after successful test
+                setTimeout(() => { fetchBenchmarks(); fetchSessions(); }, 1000);
                 currentSessionId = null;
             } else {
                 banner.className = 'result-banner failure';
                 resultText.textContent = `✗ Test FAILED: ${data.error}`;
-                // Show cleanup options if we have a session
                 if (currentSessionId) {
                     errorActions.style.display = 'flex';
                 } else {
@@ -577,11 +831,7 @@
         }
 
         async function cleanupSession() {
-            if (!currentSessionId) {
-                addLog('warning', 'No active session to cleanup');
-                return;
-            }
-
+            if (!currentSessionId) { addLog('warning', 'No active session to cleanup'); return; }
             document.getElementById('errorActions').style.display = 'none';
             await cleanupSessionById(currentSessionId);
             document.getElementById('resultText').textContent += ' (Cleanup initiated)';
@@ -591,10 +841,7 @@
             const sessionId = currentSessionId;
             document.getElementById('errorActions').style.display = 'none';
             document.getElementById('resultText').textContent += ' (Session left running)';
-            addLog('warning', `Session ${sessionId ? sessionId.substring(0, 12) + '...' : 'unknown'} left running - remember to cleanup manually`);
-            if (sessionId) {
-                addLog('info', `To cleanup later: curl -X POST http://localhost:8081/api/session/cleanup -H "Content-Type: application/json" -d '{"session_id":"${sessionId}"}'`);
-            }
+            addLog('warning', `Session ${sessionId ? sessionId.substring(0, 12) + '...' : 'unknown'} left running`);
         }
 
         function updateServiceStatus(status) {
@@ -642,11 +889,8 @@
                 const data = await resp.json();
 
                 if (data.sessions && data.sessions.length > 0) {
-                    // Merge with existing session log, preserving local result state
                     const existingResults = {};
-                    sessionLog.forEach(s => {
-                        if (s.result) existingResults[s.id] = s.result;
-                    });
+                    sessionLog.forEach(s => { if (s.result) existingResults[s.id] = s.result; });
 
                     sessionLog = data.sessions.map(s => ({
                         id: s.id,
@@ -658,10 +902,7 @@
                         ssh_host: s.ssh_host,
                         ssh_port: s.ssh_port,
                         timestamp: s.created_at || new Date().toISOString(),
-                        // Preserve local result state or derive from status
-                        result: existingResults[s.id] ||
-                                (s.status === 'stopped' ? 'stopped' : null) ||
-                                (s.status === 'failed' ? 'failed' : null)
+                        result: existingResults[s.id] || (s.status === 'stopped' ? 'stopped' : null) || (s.status === 'failed' ? 'failed' : null)
                     }));
 
                     renderSessionLog();
@@ -671,12 +912,102 @@
             }
         }
 
+        async function fetchBenchmarks() {
+            try {
+                const resp = await fetch('/api/benchmarks?limit=100');
+                const data = await resp.json();
+                allBenchmarks = data.benchmarks || [];
+
+                // Index by session ID
+                benchmarksBySession = {};
+                allBenchmarks.forEach(b => {
+                    benchmarksBySession[b.session_id] = b;
+                });
+
+                renderSessionLog();
+                renderBenchmarkTable();
+            } catch (e) {
+                console.error('Failed to fetch benchmarks:', e);
+            }
+        }
+
+        function loadBenchmarks() {
+            fetchBenchmarks();
+            loadComparison();
+        }
+
+        function renderBenchmarkTable() {
+            const tbody = document.getElementById('benchmarkTableBody');
+
+            if (allBenchmarks.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="9" class="no-data">No benchmarks recorded yet. Run a test to create benchmarks.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = allBenchmarks.map(b => {
+                const time = b.timestamp ? new Date(b.timestamp).toLocaleString() : '-';
+                const modelShort = b.model_id?.split('/').pop() || '-';
+                return `
+                    <tr>
+                        <td>${time}</td>
+                        <td>${modelShort}</td>
+                        <td>${b.gpu_type || '-'}</td>
+                        <td>${b.provider || '-'}</td>
+                        <td class="benchmark-value highlight">${b.avg_tokens_per_second?.toFixed(1) || '-'}</td>
+                        <td class="benchmark-value">${b.avg_time_to_first_token_ms?.toFixed(0) || '-'}ms</td>
+                        <td class="benchmark-value">$${b.price_per_hour?.toFixed(3) || '-'}</td>
+                        <td class="benchmark-value highlight">${b.tokens_per_dollar?.toFixed(1) || '-'}</td>
+                        <td class="benchmark-value">$${b.cost_per_million_tokens?.toFixed(4) || '-'}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        async function loadComparison() {
+            const modelId = document.getElementById('compareModelSelect').value;
+            const container = document.getElementById('comparisonResults');
+
+            try {
+                const resp = await fetch(`/api/benchmarks/compare/${encodeURIComponent(modelId)}`);
+                const data = await resp.json();
+
+                if (!data.comparisons || data.comparisons.length === 0) {
+                    container.innerHTML = '<div class="no-data">No benchmark data for this model yet</div>';
+                    return;
+                }
+
+                container.innerHTML = data.comparisons.map((c, i) => `
+                    <div class="comparison-card">
+                        <div class="comparison-header">
+                            <span class="comparison-gpu">${i === 0 ? '🏆 ' : ''}${c.gpu_type}</span>
+                            <span style="color: var(--text-secondary); font-size: 0.8rem;">${c.sample_count} test(s) via ${c.providers.join(', ')}</span>
+                        </div>
+                        <div class="comparison-stats">
+                            <div class="stat-box">
+                                <div class="stat-value">${c.avg_tokens_per_second?.toFixed(1)}</div>
+                                <div class="stat-label">Tokens/sec</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-value">$${c.avg_price_per_hour?.toFixed(3)}</div>
+                                <div class="stat-label">$/hour</div>
+                            </div>
+                            <div class="stat-box">
+                                <div class="stat-value">${c.avg_tokens_per_dollar?.toFixed(1)}</div>
+                                <div class="stat-label">Tokens/$</div>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                container.innerHTML = '<div class="no-data">Failed to load comparison</div>';
+            }
+        }
+
         async function runTest() {
             const btn = document.getElementById('runBtn');
             btn.disabled = true;
             btn.textContent = 'Running...';
 
-            // Reset state
             currentSessionId = null;
             document.getElementById('resultBanner').style.display = 'none';
             document.getElementById('errorActions').style.display = 'none';
@@ -712,9 +1043,11 @@
         });
 
         connect();
-        fetchSessions(); // Load sessions on page load
+        fetchSessions();
+        fetchBenchmarks();
         setInterval(fetchStatus, 30000);
-        setInterval(fetchSessions, 10000); // Refresh sessions every 10s
+        setInterval(fetchSessions, 10000);
+        setInterval(fetchBenchmarks, 15000);
     </script>
 </body>
 </html>

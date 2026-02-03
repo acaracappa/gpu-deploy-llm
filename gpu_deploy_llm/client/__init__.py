@@ -9,6 +9,12 @@ from .models import (
     SessionDiagnostics,
     CostInfo,
     InventoryFilter,
+    HealthResponse,
+    ReadyResponse,
+    ExtendSessionRequest,
+    StoragePolicy,
+    LaunchMode,
+    WorkloadType,
 )
 from .shopper import ShopperClient
 
@@ -21,5 +27,11 @@ __all__ = [
     "SessionDiagnostics",
     "CostInfo",
     "InventoryFilter",
+    "HealthResponse",
+    "ReadyResponse",
+    "ExtendSessionRequest",
+    "StoragePolicy",
+    "LaunchMode",
+    "WorkloadType",
     "ShopperClient",
 ]

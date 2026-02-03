@@ -8,6 +8,7 @@ Matches patterns from cloud-gpu-shopper:
 import asyncio
 import logging
 import os
+import shlex
 import tempfile
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -80,6 +81,12 @@ class SSHConnection:
             result = await ssh.run("nvidia-smi")
             if result.success:
                 print(result.stdout)
+
+        # With port forwarding:
+        async with SSHConnection(host, port, user, private_key) as ssh:
+            async with ssh.forward_local_port(8000, 8000) as local_port:
+                # Access remote vLLM at http://localhost:{local_port}/v1/models
+                response = httpx.get(f"http://localhost:{local_port}/v1/models")
     """
 
     def __init__(
@@ -142,38 +149,43 @@ class SSHConnection:
                     port=self.port,
                     username=self.user,
                     client_keys=[key],
-                    known_hosts=None,  # Accept any host key (cloud instances)
+                    # Accept any host key - required for ephemeral cloud GPU instances
+                    # where host keys are regenerated on each provision. Host key
+                    # verification is not feasible for these dynamic environments.
+                    # Security note: This makes MITM attacks possible in theory,
+                    # but cloud provider networks are considered trusted.
+                    known_hosts=None,
                 ),
                 timeout=self.connect_timeout,
             )
             logger.info(f"SSH connected to {self.user}@{self.host}:{self.port}")
         except asyncio.TimeoutError:
+            # Clean up key file on connection failure
+            self._cleanup_key_file()
             raise SSHConnectionError(
                 f"SSH connection timeout ({self.connect_timeout}s)",
                 host=self.host,
                 port=self.port,
             )
         except asyncssh.Error as e:
+            # Clean up key file on connection failure
+            self._cleanup_key_file()
             raise SSHConnectionError(
                 f"SSH connection failed: {e}",
                 host=self.host,
                 port=self.port,
             )
         except Exception as e:
+            # Clean up key file on connection failure
+            self._cleanup_key_file()
             raise SSHConnectionError(
                 f"SSH connection error: {e}",
                 host=self.host,
                 port=self.port,
             )
 
-    async def close(self) -> None:
-        """Close SSH connection and cleanup key file."""
-        if self._conn:
-            self._conn.close()
-            await self._conn.wait_closed()
-            self._conn = None
-
-        # Securely delete key file
+    def _cleanup_key_file(self) -> None:
+        """Securely delete the temporary key file."""
         if self._key_file and os.path.exists(self._key_file):
             try:
                 os.unlink(self._key_file)
@@ -181,6 +193,18 @@ class SSHConnection:
             except Exception as e:
                 logger.warning(f"Failed to delete key file: {e}")
             self._key_file = None
+
+    async def close(self) -> None:
+        """Close SSH connection and cleanup key file."""
+        if self._conn:
+            self._conn.close()
+            try:
+                await asyncio.wait_for(self._conn.wait_closed(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("SSH connection wait_closed() timed out")
+            self._conn = None
+
+        self._cleanup_key_file()
 
     async def run(
         self,
@@ -325,7 +349,10 @@ class SSHConnection:
         Returns:
             Container logs
         """
-        result = await self.run(f"docker logs --tail {tail} {container_name}")
+        # Sanitize inputs to prevent command injection
+        safe_name = shlex.quote(container_name)
+        safe_tail = int(tail)  # Ensure tail is an integer
+        result = await self.run(f"docker logs --tail {safe_tail} {safe_name}")
         # Combine stdout and stderr (docker logs goes to stderr for some containers)
         return result.stdout + result.stderr
 
@@ -351,5 +378,92 @@ class SSHConnection:
 
     async def file_exists(self, path: str) -> bool:
         """Check if a file exists."""
-        result = await self.run(f"test -f {path} && echo 'exists'")
+        safe_path = shlex.quote(path)
+        result = await self.run(f"test -f {safe_path} && echo 'exists'")
         return result.success and "exists" in result.stdout
+
+    def forward_local_port(
+        self,
+        local_port: int,
+        remote_port: int,
+        remote_host: str = "localhost",
+    ) -> "PortForwardContext":
+        """Create a local port forward to access remote services.
+
+        This creates an SSH tunnel that forwards connections from
+        localhost:{local_port} to {remote_host}:{remote_port} on the
+        remote machine.
+
+        Args:
+            local_port: Local port to listen on (0 = auto-assign)
+            remote_port: Remote port to forward to
+            remote_host: Remote host to forward to (default: localhost)
+
+        Returns:
+            Context manager that yields the actual local port being used
+
+        Usage:
+            async with ssh.forward_local_port(8000, 8000) as port:
+                response = httpx.get(f"http://localhost:{port}/v1/models")
+        """
+        return PortForwardContext(self, local_port, remote_port, remote_host)
+
+
+class PortForwardContext:
+    """Context manager for SSH port forwarding."""
+
+    def __init__(
+        self,
+        ssh: SSHConnection,
+        local_port: int,
+        remote_port: int,
+        remote_host: str = "localhost",
+    ):
+        self.ssh = ssh
+        self.local_port = local_port
+        self.remote_port = remote_port
+        self.remote_host = remote_host
+        self._listener = None
+        self._actual_port = None
+
+    async def __aenter__(self) -> int:
+        """Start port forwarding and return the local port."""
+        if not self.ssh._conn:
+            raise SSHConnectionError(
+                "Not connected",
+                host=self.ssh.host,
+                port=self.ssh.port,
+            )
+
+        try:
+            # Create local port forwarder
+            # If local_port is 0, asyncssh will auto-assign an available port
+            self._listener = await self.ssh._conn.forward_local_port(
+                "",  # Listen on all local interfaces
+                self.local_port,
+                self.remote_host,
+                self.remote_port,
+            )
+            self._actual_port = self._listener.get_port()
+            logger.info(
+                f"Port forward established: localhost:{self._actual_port} -> "
+                f"{self.remote_host}:{self.remote_port}"
+            )
+            return self._actual_port
+        except Exception as e:
+            raise SSHConnectionError(
+                f"Failed to create port forward: {e}",
+                host=self.ssh.host,
+                port=self.ssh.port,
+            )
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Stop port forwarding."""
+        if self._listener:
+            self._listener.close()
+            try:
+                await asyncio.wait_for(self._listener.wait_closed(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Port forward wait_closed() timed out")
+            logger.debug(f"Port forward closed: localhost:{self._actual_port}")
+            self._listener = None

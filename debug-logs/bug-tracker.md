@@ -27,3 +27,18 @@
 _Errors will be appended below as they occur_
 
 ---
+
+## Changes Log
+
+### 2026-01-31 14:45 - Benchmarking Step Added
+- Added `deploy/benchmark.py` with test prompts and response comparison
+- New step in flow: `verify_deployment → benchmark → cleanup`
+- Test prompts include: math, coding, knowledge, creative, instruction
+- Metrics: tokens/sec, time-to-first-token, response quality match rate
+
+### 2026-01-31 14:45 - Verbose Model Loading Logs
+- Updated `deploy/health.py` wait_for_ready() with progress callback
+- Now logs: elapsed time, health status, model status, connection errors
+- Handles: ConnectError, ReadTimeout with descriptive messages
+
+---

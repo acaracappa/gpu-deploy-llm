@@ -1,7 +1,7 @@
 """Tests for client Pydantic models."""
 
 import pytest
-from datetime import datetime
+from datetime import datetime, timezone
 from gpu_deploy_llm.client.models import (
     GPUOffer,
     Session,
@@ -65,7 +65,7 @@ class TestSession:
             gpu_type="RTX 4090",
             gpu_count=1,
             price_per_hour=0.45,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
         assert session.status == SessionStatus.RUNNING
         assert not session.is_terminal
@@ -81,7 +81,7 @@ class TestSession:
             gpu_type="RTX 4090",
             gpu_count=1,
             price_per_hour=0.45,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
         assert session.is_terminal
 
@@ -96,7 +96,7 @@ class TestSession:
             gpu_type="RTX 4090",
             gpu_count=1,
             price_per_hour=0.45,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             error="SSH timeout",
         )
         assert session.is_terminal
@@ -114,7 +114,7 @@ class TestSession:
             gpu_type="RTX 4090",
             gpu_count=1,
             price_per_hour=0.45,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
         assert not session.is_connectable
 

@@ -35,6 +35,9 @@ from .models import (
     HealthResponse,
     ReadyResponse,
     ExtendSessionRequest,
+    LaunchMode,
+    WorkloadType,
+    StoragePolicy,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,17 +92,30 @@ class ShopperClient:
         self._client: Optional[httpx.AsyncClient] = None
 
     async def __aenter__(self) -> "ShopperClient":
-        self._client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=httpx.Timeout(self.timeout, connect=DEFAULT_CONNECT_TIMEOUT),
-            headers={
-                "User-Agent": f"gpu-deploy-llm/{__version__}",
-                "Accept": "application/json",
-            },
-        )
-        return self
+        try:
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=httpx.Timeout(self.timeout, connect=DEFAULT_CONNECT_TIMEOUT),
+                headers={
+                    "User-Agent": f"gpu-deploy-llm/{__version__}",
+                    "Accept": "application/json",
+                },
+            )
+            return self
+        except Exception:
+            # Ensure partial client is cleaned up
+            if self._client:
+                await self._client.aclose()
+                self._client = None
+            raise
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    async def close(self) -> None:
+        """Explicitly close the client (for non-context-manager usage)."""
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -137,7 +153,23 @@ class ShopperClient:
         """Make HTTP request with error handling."""
         self._log_request(method, path, **kwargs)
 
-        response = await self.client.request(method, path, **kwargs)
+        try:
+            response = await self.client.request(method, path, **kwargs)
+        except httpx.TimeoutException as e:
+            raise ShopperAPIError(
+                f"Request timeout: {method} {path}",
+                status_code=None,
+            ) from e
+        except httpx.ConnectError as e:
+            raise ShopperAPIError(
+                f"Connection failed: {self.base_url}",
+                status_code=None,
+            ) from e
+        except httpx.RequestError as e:
+            raise ShopperAPIError(
+                f"Request error: {e}",
+                status_code=None,
+            ) from e
 
         self._log_response(response)
 
@@ -157,9 +189,15 @@ class ShopperClient:
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
+            retry_after_int = None
+            if retry_after:
+                try:
+                    retry_after_int = int(retry_after)
+                except ValueError:
+                    logger.warning(f"Invalid Retry-After header: {retry_after}")
             raise RateLimitError(
                 message=message,
-                retry_after=int(retry_after) if retry_after else None,
+                retry_after=retry_after_int,
                 request_id=request_id,
             )
 
@@ -230,22 +268,30 @@ class ShopperClient:
         import asyncio
         import time
 
-        deadline = time.time() + timeout
+        start_time = time.time()
+        deadline = start_time + timeout
 
-        while time.time() < deadline:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"Shopper not ready after {timeout}s")
+
             try:
                 result = await self.ready_check()
                 if result.ready:
                     return True
                 logger.info(f"Shopper not ready: {result.message}")
+            except asyncio.CancelledError:
+                raise  # Re-raise CancelledError, don't swallow it
             except ShopperNotReadyError as e:
                 logger.info(f"Shopper not ready: {e}")
             except Exception as e:
                 logger.warning(f"Ready check error: {e}")
 
-            await asyncio.sleep(interval)
-
-        raise TimeoutError(f"Shopper not ready after {timeout}s")
+            # Sleep for interval or remaining time, whichever is smaller
+            sleep_time = min(interval, remaining)
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
 
     # Inventory
 
@@ -271,7 +317,7 @@ class ShopperClient:
         """
         params = {}
         if min_vram is not None:
-            params["min_vram"] = min_vram
+            params["min_vram"] = int(min_vram)  # API expects integer
         if max_price is not None:
             params["max_price"] = max_price
         if provider is not None:
@@ -298,13 +344,33 @@ class ShopperClient:
         offer_id: str,
         reservation_hours: int = 1,
         workload_type: str = "llm_vllm",
-        storage_policy: str = "destroy",
+        storage_policy: StoragePolicy = StoragePolicy.DESTROY,
         idle_threshold_minutes: Optional[int] = None,
+        # Entrypoint mode parameters
+        launch_mode: Optional[str] = None,
+        docker_image: Optional[str] = None,
+        model_id: Optional[str] = None,
+        exposed_ports: Optional[List[int]] = None,
+        quantization: Optional[str] = None,
     ) -> CreateSessionResponse:
         """Create a new session (POST /api/v1/sessions).
 
         IMPORTANT: The SSH private key is ONLY returned here!
         Capture response.ssh_private_key immediately.
+
+        Two modes available:
+        1. SSH mode (default): Get SSH access, deploy manually
+        2. Entrypoint mode: Pre-built Docker image runs automatically
+
+        For entrypoint mode with vLLM Docker image (recommended for instances
+        without general internet access):
+            await client.create_session(
+                offer_id="...",
+                launch_mode="entrypoint",
+                docker_image="vllm/vllm-openai:latest",
+                model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                exposed_ports=[8000],
+            )
 
         Args:
             offer_id: ID of the offer to provision
@@ -312,6 +378,11 @@ class ShopperClient:
             workload_type: Workload type (default: llm_vllm)
             storage_policy: Storage cleanup policy (preserve/destroy)
             idle_threshold_minutes: Optional idle timeout
+            launch_mode: "ssh" (default) or "entrypoint" (Docker-based)
+            docker_image: Docker image for entrypoint mode
+            model_id: HuggingFace model ID for entrypoint mode
+            exposed_ports: Ports to expose (e.g., [8000] for vLLM)
+            quantization: Quantization method (awq, gptq)
 
         Returns:
             CreateSessionResponse with session and SSH private key
@@ -323,6 +394,11 @@ class ShopperClient:
             reservation_hours=reservation_hours,
             storage_policy=storage_policy,
             idle_threshold_minutes=idle_threshold_minutes,
+            launch_mode=launch_mode,
+            docker_image=docker_image,
+            model_id=model_id,
+            exposed_ports=exposed_ports,
+            quantization=quantization,
         )
 
         response = await self._request(
@@ -335,10 +411,25 @@ class ShopperClient:
             self._handle_error(response, "Failed to create session")
 
         data = response.json()
+        session_data = data.get("session")
+        if session_data is None:
+            raise ShopperAPIError(
+                "Response missing 'session' key",
+                status_code=response.status_code,
+            )
         return CreateSessionResponse(
-            session=Session(**data.get("session", data)),
+            session=Session(**session_data),
             ssh_private_key=data.get("ssh_private_key", ""),
         )
+
+    def _validate_session_id(self, session_id: str) -> None:
+        """Validate session ID to prevent path traversal."""
+        if not session_id:
+            raise ValueError("session_id cannot be empty")
+        if "/" in session_id or "\\" in session_id:
+            raise ValueError("session_id contains invalid characters")
+        if session_id in (".", ".."):
+            raise ValueError("session_id cannot be '.' or '..'")
 
     async def get_session(self, session_id: str) -> Session:
         """Get session details (GET /api/v1/sessions/:id).
@@ -349,6 +440,7 @@ class ShopperClient:
         Returns:
             Session object
         """
+        self._validate_session_id(session_id)
         response = await self._request("GET", f"/api/v1/sessions/{session_id}")
 
         if response.status_code == 404:
@@ -405,8 +497,9 @@ class ShopperClient:
             session_id: Session ID
 
         Returns:
-            Updated session
+            Updated session (may be minimal for 204 responses)
         """
+        self._validate_session_id(session_id)
         response = await self._request("POST", f"/api/v1/sessions/{session_id}/done")
 
         if response.status_code == 404:
@@ -415,8 +508,20 @@ class ShopperClient:
                 status_code=404,
             )
 
-        if response.status_code not in (200, 202):
+        if response.status_code not in (200, 202, 204):
             self._handle_error(response, f"Failed to signal done for {session_id}")
+
+        # Handle 204 No Content response
+        if response.status_code == 204:
+            return Session(
+                id=session_id,
+                consumer_id=self.consumer_id,
+                status=SessionStatus.STOPPING,
+                provider="unknown",
+                gpu_type="unknown",
+                gpu_count=0,
+                price_per_hour=0,
+            )
 
         # API may return just a message instead of full session
         data = response.json()
@@ -444,6 +549,7 @@ class ShopperClient:
         Returns:
             Updated session
         """
+        self._validate_session_id(session_id)
         response = await self._request("DELETE", f"/api/v1/sessions/{session_id}")
 
         if response.status_code == 404:
@@ -496,6 +602,7 @@ class ShopperClient:
         Returns:
             Updated session with new expiry
         """
+        self._validate_session_id(session_id)
         request = ExtendSessionRequest(additional_hours=additional_hours)
 
         response = await self._request(
@@ -527,6 +634,7 @@ class ShopperClient:
         Returns:
             Session diagnostics
         """
+        self._validate_session_id(session_id)
         response = await self._request(
             "GET", f"/api/v1/sessions/{session_id}/diagnostics"
         )

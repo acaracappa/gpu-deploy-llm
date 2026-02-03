@@ -35,6 +35,28 @@ class StoragePolicy(str, Enum):
     DESTROY = "destroy"
 
 
+class LaunchMode(str, Enum):
+    """Launch mode for session deployment.
+
+    SSH mode: Interactive SSH access, deploy workloads manually via pip/scripts
+    Entrypoint mode: Pre-built Docker image runs automatically (recommended)
+    """
+
+    SSH = "ssh"
+    ENTRYPOINT = "entrypoint"
+
+
+class WorkloadType(str, Enum):
+    """Workload type for the session."""
+
+    LLM = "llm"
+    LLM_VLLM = "llm_vllm"
+    LLM_TGI = "llm_tgi"
+    TRAINING = "training"
+    BATCH = "batch"
+    INTERACTIVE = "interactive"
+
+
 class GPUOffer(BaseModel):
     """GPU offer from cloud-gpu-shopper inventory.
 
@@ -78,6 +100,12 @@ class Session(BaseModel):
     ssh_port: Optional[int] = Field(None, description="SSH port")
     ssh_user: Optional[str] = Field(None, description="SSH username")
 
+    # API endpoint details (entrypoint mode)
+    launch_mode: Optional[str] = Field(None, description="Launch mode: ssh or entrypoint")
+    api_endpoint: Optional[str] = Field(None, description="Full URL to API (entrypoint mode)")
+    api_port: Optional[int] = Field(None, description="Mapped API port (entrypoint mode)")
+    model_id: Optional[str] = Field(None, description="HuggingFace model ID")
+
     # Timing
     created_at: Optional[datetime] = Field(None, description="Creation timestamp")
     expires_at: Optional[datetime] = Field(None, description="Expiration timestamp")
@@ -117,6 +145,19 @@ class CreateSessionRequest(BaseModel):
     """Request body for POST /api/v1/sessions.
 
     Matches internal/api/handlers.go CreateSessionRequest struct.
+
+    Two deployment modes:
+    1. SSH mode (default): Get SSH access, deploy workloads manually
+    2. Entrypoint mode: Pre-built Docker image runs automatically (recommended)
+
+    For entrypoint mode with vLLM:
+        CreateSessionRequest(
+            launch_mode=LaunchMode.ENTRYPOINT,
+            docker_image="vllm/vllm-openai:latest",
+            model_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+            exposed_ports=[8000],
+            ...
+        )
     """
 
     offer_id: str = Field(..., description="ID of the offer to provision")
@@ -136,6 +177,28 @@ class CreateSessionRequest(BaseModel):
     )
     idle_threshold_minutes: Optional[int] = Field(
         None, description="Idle timeout in minutes"
+    )
+
+    # Entrypoint mode configuration
+    launch_mode: Optional[LaunchMode] = Field(
+        None,
+        description="Launch mode: 'ssh' (default) or 'entrypoint' (Docker-based)",
+    )
+    docker_image: Optional[str] = Field(
+        None,
+        description="Docker image for entrypoint mode (e.g., 'vllm/vllm-openai:latest')",
+    )
+    model_id: Optional[str] = Field(
+        None,
+        description="HuggingFace model ID for entrypoint mode",
+    )
+    exposed_ports: Optional[List[int]] = Field(
+        None,
+        description="Ports to expose (e.g., [8000] for vLLM)",
+    )
+    quantization: Optional[str] = Field(
+        None,
+        description="Quantization method (awq, gptq)",
     )
 
 

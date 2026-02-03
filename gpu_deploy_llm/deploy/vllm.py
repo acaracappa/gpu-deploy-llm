@@ -13,6 +13,7 @@ Security requirements implemented:
 
 import logging
 import secrets
+import shlex
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -51,7 +52,7 @@ class DeploymentConfig:
     gpu_memory_utilization: float = 0.9
     max_model_len: Optional[int] = None
     api_key: Optional[str] = None  # Auto-generated if not provided
-    mode: DeploymentMode = DeploymentMode.AUTO
+    mode: DeploymentMode = DeploymentMode.PIP  # Default to pip - more reliable on cloud GPUs
 
     # Docker settings
     image: str = VLLM_IMAGE
@@ -168,6 +169,11 @@ class VLLMDeployer:
             logger.info(f"vLLM deployed successfully at {result.endpoint}")
 
         except DeploymentError:
+            # Cleanup container before re-raising
+            try:
+                await self._stop_existing_container(config.container_name)
+            except Exception as cleanup_err:
+                logger.warning(f"Container cleanup failed: {cleanup_err}")
             raise
         except Exception as e:
             result.error = str(e)
@@ -178,8 +184,14 @@ class VLLMDeployer:
                 result.container_logs = await self.ssh.get_container_logs(
                     config.container_name
                 )
-            except Exception:
-                pass
+            except Exception as log_err:
+                logger.warning(f"Failed to collect container logs: {log_err}")
+
+            # Cleanup container
+            try:
+                await self._stop_existing_container(config.container_name)
+            except Exception as cleanup_err:
+                logger.warning(f"Container cleanup failed: {cleanup_err}")
 
             raise DeploymentError(str(e), stage="deploy_docker")
 
@@ -194,6 +206,7 @@ class VLLMDeployer:
             api_key=config.api_key or "",
             mode=DeploymentMode.PIP,
         )
+        started_pid: Optional[int] = None
 
         try:
             # Step 1: Check Python availability
@@ -215,6 +228,7 @@ class VLLMDeployer:
             logger.info(f"Starting vLLM server with model: {config.model_id}")
             start_start = time.time()
             pid = await self._start_vllm_process(config, python_cmd)
+            started_pid = pid
             result.process_pid = pid
             result.start_duration_seconds = time.time() - start_start
             logger.info(f"vLLM process started (PID: {pid})")
@@ -226,10 +240,16 @@ class VLLMDeployer:
             logger.info(f"vLLM deployed successfully at {result.endpoint}")
 
         except DeploymentError:
+            # Cleanup process if it was started
+            if started_pid is not None:
+                await self._kill_vllm_process(started_pid)
             raise
         except Exception as e:
             result.error = str(e)
             logger.error(f"Pip deployment failed: {e}")
+            # Cleanup process if it was started
+            if started_pid is not None:
+                await self._kill_vllm_process(started_pid)
             raise DeploymentError(str(e), stage="deploy_pip")
 
         return result
@@ -247,6 +267,13 @@ class VLLMDeployer:
         """Kill any existing vLLM processes."""
         await self.ssh.run("pkill -f 'vllm.entrypoints' || true")
         await self.ssh.run("pkill -f 'vllm serve' || true")
+
+    async def _kill_vllm_process(self, pid: int) -> None:
+        """Kill a specific vLLM process by PID."""
+        try:
+            await self.ssh.run(f"kill -9 {pid} 2>/dev/null || true")
+        except Exception as e:
+            logger.warning(f"Failed to kill PID {pid}: {e}")
 
     async def _ensure_pip(self, python_cmd: str) -> None:
         """Ensure pip is available, install if needed."""
@@ -285,14 +312,105 @@ class VLLMDeployer:
             stage="install_pip",
         )
 
+    async def _detect_cuda_version(self) -> str:
+        """Detect CUDA version from nvidia-smi to select correct PyTorch wheel."""
+        # Try to get CUDA version from nvidia-smi
+        result = await self.ssh.run(
+            "nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1"
+        )
+
+        if result.success and result.stdout.strip():
+            driver_version = result.stdout.strip()
+            try:
+                major = int(driver_version.split('.')[0])
+                # Driver 525+ supports CUDA 12.x, older drivers use CUDA 11.8
+                if major >= 525:
+                    logger.info(f"Driver {driver_version} detected, using CUDA 12.1")
+                    return "cu121"
+                else:
+                    logger.info(f"Driver {driver_version} detected, using CUDA 11.8")
+                    return "cu118"
+            except (ValueError, IndexError):
+                pass
+
+        # Default to CUDA 12.1 (most common on recent cloud GPUs)
+        logger.info("Could not detect driver version, defaulting to CUDA 12.1")
+        return "cu121"
+
     async def _install_vllm_pip(self, python_cmd: str) -> None:
-        """Install vLLM via pip."""
+        """Install vLLM via pip with all required dependencies.
+
+        Installation order is critical:
+        1. Detect CUDA version from driver
+        2. Install PyTorch with correct CUDA support
+        3. Verify PyTorch CUDA is working
+        4. Install numpy < 2.0 (vLLM/transformers compatibility)
+        5. Install vLLM
+        6. Verify vLLM imports correctly
+        """
         # Ensure pip is available
         await self._ensure_pip(python_cmd)
 
-        # Install vLLM with timeout for large package
+        # Step 1: Detect CUDA version
+        cuda_version = await self._detect_cuda_version()
+
+        # Step 2: Install PyTorch with CUDA support first (required by vLLM)
+        logger.info(f"Installing PyTorch with CUDA support ({cuda_version})...")
+        torch_result = await self.ssh.run(
+            f"{python_cmd} -m pip install torch --index-url https://download.pytorch.org/whl/{cuda_version}",
+            timeout=600,  # 10 min timeout for PyTorch download
+        )
+
+        if not torch_result.success:
+            logger.warning(f"PyTorch {cuda_version} install failed, trying cu118: {torch_result.stderr}")
+            torch_result = await self.ssh.run(
+                f"{python_cmd} -m pip install torch --index-url https://download.pytorch.org/whl/cu118",
+                timeout=600,
+            )
+
+        if not torch_result.success:
+            logger.warning(f"PyTorch CUDA install failed, trying default: {torch_result.stderr}")
+            torch_result = await self.ssh.run(
+                f"{python_cmd} -m pip install torch",
+                timeout=600,
+            )
+
+        # Step 3: Verify PyTorch CUDA is working
+        logger.info("Verifying PyTorch CUDA...")
+        verify_torch = await self.ssh.run(
+            f'{python_cmd} -c "import torch; print(f\'PyTorch {{torch.__version__}}, CUDA: {{torch.cuda.is_available()}}\')"'
+        )
+        if verify_torch.success:
+            logger.info(f"PyTorch verification: {verify_torch.stdout.strip()}")
+            if "CUDA: False" in verify_torch.stdout:
+                logger.warning("PyTorch installed but CUDA not available - model loading may fail")
+        else:
+            raise DeploymentError(
+                f"PyTorch installation failed: {verify_torch.stderr}",
+                stage="install_pytorch",
+            )
+
+        # Step 4: Install compatible numpy version (vLLM/transformers need numpy < 2.0)
+        # numpy 2.0 removed numpy.lib.function_base which breaks many ML libraries
+        logger.info("Installing compatible numpy (<2.0)...")
+        numpy_result = await self.ssh.run(
+            f"{python_cmd} -m pip install 'numpy>=1.26,<2.0'",
+            timeout=120,
+        )
+        if not numpy_result.success:
+            logger.warning(f"numpy install warning: {numpy_result.stderr}")
+
+        # Verify numpy version
+        verify_numpy = await self.ssh.run(
+            f'{python_cmd} -c "import numpy; print(f\'numpy {{numpy.__version__}}\')"'
+        )
+        if verify_numpy.success:
+            logger.info(f"numpy verification: {verify_numpy.stdout.strip()}")
+
+        # Step 5: Install vLLM
+        logger.info(f"Installing vLLM {VLLM_PIP_VERSION}...")
         result = await self.ssh.run(
-            f"{python_cmd} -m pip install --upgrade vllm=={VLLM_PIP_VERSION}",
+            f"{python_cmd} -m pip install vllm=={VLLM_PIP_VERSION}",
             timeout=600,  # 10 min timeout
         )
 
@@ -300,7 +418,7 @@ class VLLMDeployer:
             # Try without version pinning as fallback
             logger.warning(f"Pinned version failed, trying latest: {result.stderr}")
             result = await self.ssh.run(
-                f"{python_cmd} -m pip install --upgrade vllm",
+                f"{python_cmd} -m pip install vllm",
                 timeout=600,
             )
 
@@ -310,28 +428,54 @@ class VLLMDeployer:
                 stage="install_vllm",
             )
 
+        # Step 6: Verify vLLM imports correctly
+        logger.info("Verifying vLLM installation...")
+        verify_vllm = await self.ssh.run(
+            f'{python_cmd} -c "from vllm import LLM; print(\'vLLM import OK\')"',
+            timeout=60,
+        )
+        if not verify_vllm.success:
+            # Get more details about the import error
+            detail_result = await self.ssh.run(
+                f'{python_cmd} -c "import vllm" 2>&1 | tail -10'
+            )
+            raise DeploymentError(
+                f"vLLM installation verification failed: {detail_result.stdout or verify_vllm.stderr}",
+                stage="verify_vllm",
+            )
+        logger.info("vLLM installation verified successfully")
+
     async def _start_vllm_process(
         self,
         config: DeploymentConfig,
         python_cmd: str,
     ) -> int:
-        """Start vLLM server process in background."""
+        """Start vLLM server process in background with startup verification.
+
+        Verifies:
+        1. Process starts and stays alive for 5 seconds
+        2. Process doesn't crash immediately (common with dependency issues)
+        """
+        import asyncio
+
         # Build vLLM command
+        # Use VLLM_API_KEY environment variable instead of --api-key to avoid exposing key in process list
+        # Use 'env' to set environment variable before nohup runs the command
         cmd_parts = [
-            f"VLLM_API_KEY={config.api_key}",
             "nohup",
+            "env",
+            f"VLLM_API_KEY={shlex.quote(config.api_key)}",
             python_cmd,
             "-m", "vllm.entrypoints.openai.api_server",
-            f"--model {config.model_id}",
+            f"--model {shlex.quote(config.model_id)}",
             f"--port {config.port}",
             "--host 0.0.0.0",
             f"--gpu-memory-utilization {config.gpu_memory_utilization}",
-            "--api-key-env VLLM_API_KEY",
         ]
 
         # Add quantization if specified
         if config.quantization != Quantization.NONE:
-            cmd_parts.append(f"--quantization {config.quantization.value}")
+            cmd_parts.append(f"--quantization {shlex.quote(config.quantization.value)}")
 
         # Add tensor parallelism for multi-GPU
         if config.gpu_count > 1:
@@ -354,22 +498,51 @@ class VLLMDeployer:
                 stage="start_vllm",
             )
 
-        # Get PID
-        import asyncio
-        await asyncio.sleep(2)  # Give it time to start
+        # Wait briefly for process to start
+        await asyncio.sleep(3)
 
-        pid_result = await self.ssh.run("pgrep -f 'vllm.entrypoints' | head -1")
+        # Get initial PID using pgrep -n (newest) for more reliable detection
+        pid_result = await self.ssh.run("pgrep -n -f 'vllm.entrypoints'")
+        if not (pid_result.success and pid_result.stdout.strip()):
+            # Process didn't start - get logs
+            log_result = await self.ssh.run("tail -30 /tmp/vllm.log 2>/dev/null")
+            raise DeploymentError(
+                f"vLLM process failed to start. Logs:\n{log_result.stdout}",
+                stage="start_vllm",
+            )
+
+        initial_pid = pid_result.stdout.strip()
+        logger.info(f"vLLM process started with PID {initial_pid}")
+
+        # Wait and verify process stays alive (catches immediate crashes)
+        await asyncio.sleep(5)
+
+        # Check if our specific PID is still running
+        pid_check = await self.ssh.run(f"kill -0 {initial_pid} 2>/dev/null && echo 'alive'")
+        if not (pid_check.success and "alive" in pid_check.stdout):
+            # Process died - get logs to understand why
+            log_result = await self.ssh.run("tail -50 /tmp/vllm.log 2>/dev/null")
+            raise DeploymentError(
+                f"vLLM process (PID {initial_pid}) crashed immediately after starting. Logs:\n{log_result.stdout}",
+                stage="start_vllm",
+            )
+
+        # Check if new vLLM processes spawned (indicates restart loop)
+        pid_result = await self.ssh.run("pgrep -n -f 'vllm.entrypoints'")
         if pid_result.success and pid_result.stdout.strip():
-            return int(pid_result.stdout.strip())
+            newest_pid = pid_result.stdout.strip()
+            if newest_pid != initial_pid:
+                log_result = await self.ssh.run("tail -30 /tmp/vllm.log 2>/dev/null")
+                raise DeploymentError(
+                    f"vLLM process restarting (new PID {newest_pid} detected after starting {initial_pid}). "
+                    f"This usually indicates a dependency issue. Logs:\n{log_result.stdout}",
+                    stage="start_vllm",
+                )
 
-        # Check if process failed to start
-        log_result = await self.ssh.run("cat /tmp/vllm.log | tail -20")
-        raise DeploymentError(
-            f"vLLM process failed to start. Log: {log_result.stdout}",
-            stage="start_vllm",
-        )
+        logger.info(f"vLLM process verified stable (PID {initial_pid})")
+        return int(initial_pid)
 
-    async def get_vllm_logs(self) -> str:
+    async def get_vllm_logs(self, lines: int = 50) -> str:
         """Get vLLM logs (works for both Docker and pip modes)."""
         # Try Docker first
         containers = await self.ssh.get_running_containers()
@@ -377,8 +550,45 @@ class VLLMDeployer:
             return await self.ssh.get_container_logs(CONTAINER_NAME)
 
         # Try pip mode logs
-        result = await self.ssh.run("cat /tmp/vllm.log 2>/dev/null || echo 'No logs found'")
+        result = await self.ssh.run(f"tail -{lines} /tmp/vllm.log 2>/dev/null || echo 'No logs found'")
         return result.stdout
+
+    async def get_gpu_memory_usage(self) -> str:
+        """Get GPU memory usage from nvidia-smi."""
+        result = await self.ssh.run(
+            "nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null"
+        )
+        if result.success and result.stdout.strip():
+            parts = result.stdout.strip().split(",")
+            if len(parts) >= 3:
+                used, total, util = [p.strip() for p in parts[:3]]
+                return f"GPU: {used}MB/{total}MB ({util}% util)"
+        return "GPU: unknown"
+
+    async def get_vllm_status(self) -> dict:
+        """Get comprehensive vLLM status for debugging."""
+        status = {
+            "process_running": False,
+            "pid": None,
+            "gpu_memory": "unknown",
+            "last_log_lines": [],
+        }
+
+        # Check if process is running
+        pid_result = await self.ssh.run("pgrep -f 'vllm.entrypoints' | head -1")
+        if pid_result.success and pid_result.stdout.strip():
+            status["process_running"] = True
+            status["pid"] = pid_result.stdout.strip()
+
+        # Get GPU memory
+        status["gpu_memory"] = await self.get_gpu_memory_usage()
+
+        # Get last few log lines
+        log_result = await self.ssh.run("tail -5 /tmp/vllm.log 2>/dev/null")
+        if log_result.success:
+            status["last_log_lines"] = [l for l in log_result.stdout.strip().split("\n") if l]
+
+        return status
 
     async def _stop_existing_container(self, container_name: str) -> None:
         """Stop and remove existing container if present."""
@@ -404,17 +614,17 @@ class VLLMDeployer:
     async def _start_container(self, config: DeploymentConfig) -> None:
         """Start vLLM container with secure configuration."""
         # Build docker run command with security controls
+        # Use VLLM_API_KEY environment variable instead of --api-key to avoid exposing key in process list
         cmd_parts = [
             "docker run -d",
             "--gpus all",
             "--ipc=host",  # Required for vLLM/PyTorch shared memory
             "--user 1000:1000",  # P1: Non-root container
+            f"-e VLLM_API_KEY={shlex.quote(config.api_key)}",  # P0: API key via env var (not visible in ps)
             f"-p {config.port}:{VLLM_PORT}",
-            f"-e VLLM_API_KEY={config.api_key}",  # P0: API key
-            f"--name {config.container_name}",
+            f"--name {shlex.quote(config.container_name)}",
             config.image,
-            f"--model {config.model_id}",
-            "--api-key-env VLLM_API_KEY",  # P0: Enforce API key
+            f"--model {shlex.quote(config.model_id)}",
             "--host 0.0.0.0",
             f"--port {VLLM_PORT}",
             f"--gpu-memory-utilization {config.gpu_memory_utilization}",
@@ -422,7 +632,7 @@ class VLLMDeployer:
 
         # Add quantization if specified
         if config.quantization != Quantization.NONE:
-            cmd_parts.append(f"--quantization {config.quantization.value}")
+            cmd_parts.append(f"--quantization {shlex.quote(config.quantization.value)}")
 
         # Add tensor parallelism for multi-GPU
         if config.gpu_count > 1:
@@ -446,16 +656,30 @@ class VLLMDeployer:
         self,
         container_name: str,
         timeout: int = 30,
+        max_ssh_retries: int = 3,
     ) -> None:
         """Wait for container to be running."""
         import asyncio
+        from gpu_deploy_llm.utils.errors import SSHConnectionError
 
+        ssh_errors = 0
         for _ in range(timeout):
-            result = await self.ssh.run(
-                f"docker inspect -f '{{{{.State.Running}}}}' {container_name}"
-            )
-            if result.success and "true" in result.stdout.lower():
-                return
+            try:
+                result = await self.ssh.run(
+                    f"docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(container_name)}"
+                )
+                # Reset SSH error count on successful command
+                ssh_errors = 0
+                if result.success and "true" in result.stdout.lower():
+                    return
+            except SSHConnectionError as e:
+                ssh_errors += 1
+                if ssh_errors >= max_ssh_retries:
+                    raise DeploymentError(
+                        f"SSH connection failed {max_ssh_retries} times while waiting for container: {e}",
+                        stage="wait_container",
+                    )
+                logger.warning(f"Transient SSH error ({ssh_errors}/{max_ssh_retries}): {e}")
             await asyncio.sleep(1)
 
         raise DeploymentError(
